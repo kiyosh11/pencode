@@ -1,6 +1,6 @@
 //! Rendering: opencode-style layout with brand header, transcript pane,
-//! right-side sessions sidebar, rounded prompt input, status bar and a
-//! help overlay.
+//! right-side sessions sidebar, slash-command popup, rounded prompt input,
+//! status bar and help overlay.
 
 use super::theme;
 use pencode_protocol::{Message, Part, Role};
@@ -11,8 +11,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-const BRAND: &str = "pencode";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const BRAND: &str = "pencode";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarState {
@@ -33,6 +33,23 @@ pub enum StreamStatus {
     Streaming,
 }
 
+/// Slash commands available in the prompt; kept in render for the popup.
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "show all keybinds"),
+    ("/new", "start a new session"),
+    ("/clear", "alias for /new"),
+    ("/sessions", "toggle the sessions sidebar"),
+    ("/model <provider/model>", "switch model, e.g. openai/gpt-4.1"),
+    ("/themes", "toggle dark/light theme"),
+    ("/agent", "toggle build/plan agent mode"),
+    ("/compact", "summarize this session to free context"),
+    ("/undo", "remove the last exchange"),
+    ("/retry", "re-send the last prompt"),
+    ("/init", "generate an AGENTS.md for this repo"),
+    ("/version", "print version info"),
+    ("/exit", "quit pencode"),
+];
+
 pub struct UiState {
     pub input: String,
     /// Lines scrolled back from the newest message (0 = pinned to bottom).
@@ -42,8 +59,16 @@ pub struct UiState {
     pub sessions: Vec<pencode_protocol::Session>,
     pub status: StreamStatus,
     pub error: Option<String>,
+    pub notice: Option<String>,
     /// Session id a completion is currently streaming into.
     pub streaming_message: Option<String>,
+    /// Filtered slash-command matches while input starts with `/`.
+    pub command_matches: Vec<(&'static str, &'static str)>,
+    pub command_selected: usize,
+    /// `true` while `/model` set a plan-mode style restriction.
+    pub plan_mode: bool,
+    /// Active model spec shown in the footer.
+    pub model_spec: String,
 }
 
 impl UiState {
@@ -51,13 +76,43 @@ impl UiState {
         self.sessions = store.list()?;
         Ok(())
     }
+
+    pub fn update_command_matches(&mut self) {
+        if !self.input.starts_with('/') || self.input.contains(' ') {
+            self.command_matches.clear();
+            self.command_selected = 0;
+            return;
+        }
+        let query = self.input.to_lowercase();
+        self.command_matches = COMMANDS
+            .iter()
+            .filter(|(name, _)| name.split(' ').next().unwrap_or(name).starts_with(&query))
+            .copied()
+            .collect();
+        self.command_selected = 0;
+    }
+
+    /// Replace the input with the highlighted command (keeps trailing space
+    /// for commands that take arguments).
+    pub fn accept_command(&mut self) {
+        if let Some((name, _)) =
+            self.command_matches.get(self.command_selected).copied()
+        {
+            let takes_args = name.contains(' ');
+            self.input = if takes_args {
+                format!("{name} ")
+            } else {
+                name.to_string()
+            };
+            self.update_command_matches();
+        }
+    }
 }
 
 pub fn draw(
     frame: &mut Frame,
     session: &pencode_protocol::Session,
     state: &UiState,
-    model: &str,
     directory: &str,
 ) {
     let area = frame.area();
@@ -70,10 +125,14 @@ pub fn draw(
         }
     };
 
-    draw_main(frame, main_area, session, state, model, directory);
+    draw_main(frame, main_area, session, state, directory);
 
     if let (Some(side), SidebarState::Open { selected }) = (sidebar_area, state.sidebar) {
         draw_sidebar(frame, side, state, selected, directory);
+    }
+
+    if !state.command_matches.is_empty() {
+        draw_command_popup(frame, state, area);
     }
 
     if matches!(state.help, HelpState::Visible) {
@@ -86,7 +145,6 @@ fn draw_main(
     area: Rect,
     session: &pencode_protocol::Session,
     state: &UiState,
-    model: &str,
     directory: &str,
 ) {
     let [header_area, transcript_area, input_area, footer_area] = Layout::vertical([
@@ -97,29 +155,41 @@ fn draw_main(
     ])
     .areas(area);
 
-    // Header: brand + session title + working directory (+ stream status).
-    let dir_label = shorten_path(directory, 32);
+    // Header: brand + agent mode + session title + dir + status/notice.
+    let t = theme::active();
+    let dir_label = shorten_path(directory, 28);
     let status_text = match state.status {
-        StreamStatus::Idle => match &state.error {
-            Some(err) => format!("  ⚠ {}", truncate(err, 48)),
-            None => String::new(),
+        StreamStatus::Idle => match (&state.error, &state.notice) {
+            (Some(err), _) => format!("  ⚠ {}", truncate(err, 48)),
+            (None, Some(notice)) => format!("  ✓ {}", truncate(notice, 48)),
+            (None, None) => String::new(),
         },
         StreamStatus::Thinking => "  ◍ thinking…".to_string(),
         StreamStatus::Streaming => "  ✻ streaming…".to_string(),
     };
-    let fixed = dir_label.chars().count() as u16 + status_text.chars().count() as u16 + 24;
+    let status_color = match (&state.status, &state.error, &state.notice) {
+        (StreamStatus::Idle, Some(_), _) => t.error,
+        (StreamStatus::Idle, None, Some(_)) => t.success,
+        (StreamStatus::Idle, None, None) => t.weak,
+        (StreamStatus::Thinking, _, _) => t.warning,
+        (StreamStatus::Streaming, _, _) => t.accent,
+    };
+    let mode_span = if state.plan_mode {
+        Span::styled(" plan ", theme::bold(t.warning))
+    } else {
+        Span::styled(" build ", theme::bold(t.success))
+    };
+    let fixed = dir_label.chars().count() as u16 + status_text.chars().count() as u16 + 34;
     let title_width = area.width.saturating_sub(fixed).max(8) as usize;
     let header = Line::from(vec![
-        Span::styled(" ◆ ", theme::bold(theme::PRIMARY)),
-        Span::styled(BRAND, theme::bold(theme::PRIMARY)),
-        Span::styled("  │  ", theme::fg(theme::WEAK)),
-        Span::styled(truncate(&session.title, title_width), theme::fg(theme::INK)),
-        Span::styled(format!("  ({dir_label})"), theme::fg(theme::WEAK)),
-        match state.status {
-            StreamStatus::Idle => Span::styled(status_text, theme::fg(theme::ERROR)),
-            StreamStatus::Thinking => Span::styled(status_text, theme::bold(theme::WARNING)),
-            StreamStatus::Streaming => Span::styled(status_text, theme::bold(theme::ACCENT)),
-        },
+        Span::styled(" ◆ ", theme::bold(t.primary)),
+        Span::styled(BRAND, theme::bold(t.primary)),
+        Span::styled("  │ ", theme::fg(t.weak)),
+        mode_span,
+        Span::styled(" │  ", theme::fg(t.weak)),
+        Span::styled(truncate(&session.title, title_width), theme::fg(t.ink)),
+        Span::styled(format!("  ({dir_label})"), theme::fg(t.weak)),
+        Span::styled(status_text, theme::fg(status_color)),
     ]);
     frame.render_widget(Paragraph::new(header), header_area);
 
@@ -134,16 +204,12 @@ fn draw_main(
     if lines.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  type a prompt below and press enter",
-            theme::bold(theme::PRIMARY),
+            "  type a prompt and press enter — try / for commands",
+            theme::bold(t.primary),
         )));
         lines.push(Line::from(Span::styled(
-            "  messages persist to the local session store",
-            theme::fg(theme::WEAK),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  press tab for sessions · ? for help",
-            theme::fg(theme::WEAK),
+            "  tab sessions · ? help · messages persist locally",
+            theme::fg(t.weak),
         )));
     }
 
@@ -152,11 +218,11 @@ fn draw_main(
     let offset = max_scroll.saturating_sub(state.scroll_back.min(max_scroll));
     let transcript_block = Block::bordered()
         .border_set(border::ROUNDED)
-        .border_style(theme::fg(theme::WEAK));
+        .border_style(theme::fg(t.weak));
     frame.render_widget(transcript_block, transcript_area);
     frame.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(theme::BG))
+            .style(Style::default().bg(t.bg))
             .scroll((offset as u16, 0)),
         transcript_area,
     );
@@ -164,15 +230,17 @@ fn draw_main(
     // Prompt input with rounded border and visible cursor.
     let input_block = Block::bordered()
         .border_set(border::ROUNDED)
-        .border_style(if state.input.is_empty() {
-            theme::fg(theme::WEAK)
+        .border_style(if state.input.starts_with('/') {
+            theme::fg(t.accent)
+        } else if state.input.is_empty() {
+            theme::fg(t.weak)
         } else {
-            theme::fg(theme::PRIMARY)
+            theme::fg(t.primary)
         })
-        .title(Span::styled(" prompt ", theme::fg(theme::PRIMARY)));
+        .title(Span::styled(" prompt ", theme::fg(t.primary)));
     frame.render_widget(input_block, input_area);
     frame.render_widget(
-        Paragraph::new(state.input.as_str()).style(theme::fg(theme::INK)),
+        Paragraph::new(state.input.as_str()).style(theme::fg(t.ink)),
         ratatui::widgets::Block::bordered()
             .border_set(border::ROUNDED)
             .inner(input_area),
@@ -189,94 +257,140 @@ fn draw_main(
     // Footer status bar.
     let short_session: String = session.id.chars().take(13).collect();
     let footer = Line::from(vec![
-        Span::styled(format!(" {model} "), theme::fg(theme::INFO)),
-        Span::styled("│", theme::fg(theme::WEAK)),
-        Span::styled(format!(" v{VERSION} "), theme::fg(theme::WEAK)),
-        Span::styled("│", theme::fg(theme::WEAK)),
-        Span::styled(format!(" {short_session} "), theme::fg(theme::WEAK)),
-        Span::styled("│", theme::fg(theme::WEAK)),
-        Span::styled(" tab sessions ", theme::fg(theme::ACCENT)),
-        Span::styled("·", theme::fg(theme::WEAK)),
-        Span::styled(" ? help ", theme::fg(theme::ACCENT)),
-        Span::styled("·", theme::fg(theme::WEAK)),
-        Span::styled(" enter send ", theme::fg(theme::SUCCESS)),
-        Span::styled("·", theme::fg(theme::WEAK)),
-        Span::styled(" esc quit ", theme::fg(theme::ERROR)),
+        Span::styled(format!(" {} ", state.model_spec), theme::fg(t.info)),
+        Span::styled("│", theme::fg(t.weak)),
+        Span::styled(format!(" v{VERSION} "), theme::fg(t.weak)),
+        Span::styled("│", theme::fg(t.weak)),
+        Span::styled(format!(" {short_session} "), theme::fg(t.weak)),
+        Span::styled("│", theme::fg(t.weak)),
+        Span::styled(" tab sessions ", theme::fg(t.accent)),
+        Span::styled("·", theme::fg(t.weak)),
+        Span::styled(" ? help ", theme::fg(t.accent)),
+        Span::styled("·", theme::fg(t.weak)),
+        Span::styled(" enter send ", theme::fg(t.success)),
+        Span::styled("·", theme::fg(t.weak)),
+        Span::styled(" esc quit ", theme::fg(t.error)),
     ]);
     frame.render_widget(Paragraph::new(footer), footer_area);
 }
 
+fn draw_command_popup(frame: &mut Frame, state: &UiState, full_area: Rect) {
+    let visible = state.command_matches.len().min(6);
+    let width = 52.min(full_area.width);
+    let height = ((visible as u16) + 2).min(full_area.height.saturating_sub(4));
+    // Anchor just above the bottom of the screen (above prompt+footer).
+    let y = full_area.y + full_area.height.saturating_sub(height + 5);
+    let popup = Rect { x: full_area.x + 1, y, width, height };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_set(border::ROUNDED)
+        .border_style(theme::fg(theme::active().accent))
+        .title(Span::styled(" commands ", theme::bold(theme::active().accent)))
+        .style(Style::default().bg(theme::active().bg));
+    frame.render_widget(block, popup);
+
+    let inner = Rect {
+        x: popup.x + 1,
+        y: popup.y + 1,
+        width: popup.width.saturating_sub(2),
+        height: popup.height.saturating_sub(2),
+    };
+    let start = state.command_selected.saturating_sub(visible.saturating_sub(1));
+    let lines: Vec<Line> = state
+        .command_matches
+        .iter()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+        .map(|(index, (name, desc))| {
+            let is_selected = start + index == state.command_selected;
+            let (name_style, desc_style) = if is_selected {
+                (theme::bold(theme::active().primary), theme::fg(theme::active().ink))
+            } else {
+                (theme::fg(theme::active().accent), theme::fg(theme::active().weak))
+            };
+            Line::from(vec![
+                Span::styled(format!(" {name:<26}"), name_style),
+                Span::styled(desc.to_string(), desc_style),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_sidebar(frame: &mut Frame, area: Rect, state: &UiState, selected: usize, directory: &str) {
+    let t = theme::active();
     let [sessions_area, info_area] = Layout::vertical([Constraint::Min(4), Constraint::Length(7)])
         .areas(area);
 
-    // Sessions list.
-    let width = sessions_area.width.saturating_sub(6) as usize;
+    let width = sessions_area.width.saturating_sub(8) as usize;
     let items: Vec<ListItem> = state
         .sessions
         .iter()
         .map(|session| {
-            let marker = Span::styled("● ", theme::fg(theme::SUCCESS));
             ListItem::new(Line::from(vec![
-                marker,
-                Span::styled(truncate(&session.title, width), theme::fg(theme::INK)),
-                Span::styled(format!(" {}", ago(session.created_at)), theme::fg(theme::WEAK)),
+                Span::styled("● ", theme::fg(t.success)),
+                Span::styled(truncate(&session.title, width), theme::fg(t.ink)),
+                Span::styled(format!(" {}", ago(session.created_at)), theme::fg(t.weak)),
             ]))
         })
         .collect();
 
     let list_block = Block::bordered()
         .border_set(border::ROUNDED)
-        .border_style(theme::fg(theme::ACCENT))
-        .title(Span::styled(" sessions ", theme::bold(theme::ACCENT)));
+        .border_style(theme::fg(t.accent))
+        .title(Span::styled(" sessions ", theme::bold(t.accent)));
     let list = List::new(items)
         .block(list_block)
         .highlight_symbol("▌ ")
-        .highlight_style(theme::bold(theme::PRIMARY));
+        .highlight_style(theme::bold(t.primary));
     let mut list_state = ratatui::widgets::ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, sessions_area, &mut list_state);
 
     // Info block.
-    let msg_count = state
-        .sessions
-        .iter()
-        .map(|s| s.messages.len())
-        .sum::<usize>();
+    let msg_count = state.sessions.iter().map(|s| s.messages.len()).sum::<usize>();
     let info_block = Block::bordered()
         .border_set(border::ROUNDED)
-        .border_style(theme::fg(theme::WEAK))
-        .title(Span::styled(" info ", theme::fg(theme::WEAK)));
+        .border_style(theme::fg(t.weak))
+        .title(Span::styled(" info ", theme::fg(t.weak)));
+    let mode_label = if state.plan_mode { "plan" } else { "build" };
+    let mode_color = if state.plan_mode { t.warning } else { t.success };
     let info = vec![
         Line::from(vec![
-            Span::styled(" dir   ", theme::fg(theme::WEAK)),
-            Span::styled(shorten_path(directory, 22), theme::fg(theme::INK)),
+            Span::styled(" mode  ", theme::fg(t.weak)),
+            Span::styled(mode_label.to_string(), theme::bold(mode_color)),
         ]),
         Line::from(vec![
-            Span::styled(" ses   ", theme::fg(theme::WEAK)),
-            Span::styled(state.sessions.len().to_string(), theme::fg(theme::INFO)),
-            Span::styled(" open", theme::fg(theme::WEAK)),
+            Span::styled(" dir   ", theme::fg(t.weak)),
+            Span::styled(shorten_path(directory, 22), theme::fg(t.ink)),
         ]),
         Line::from(vec![
-            Span::styled(" msgs  ", theme::fg(theme::WEAK)),
-            Span::styled(msg_count.to_string(), theme::fg(theme::INFO)),
+            Span::styled(" ses   ", theme::fg(t.weak)),
+            Span::styled(state.sessions.len().to_string(), theme::fg(t.info)),
+            Span::styled(" open", theme::fg(t.weak)),
+        ]),
+        Line::from(vec![
+            Span::styled(" msgs  ", theme::fg(t.weak)),
+            Span::styled(msg_count.to_string(), theme::fg(t.info)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" n ", theme::bold(theme::SUCCESS)),
-            Span::styled("new      ", theme::fg(theme::WEAK)),
-            Span::styled(" d ", theme::bold(theme::ERROR)),
-            Span::styled("delete", theme::fg(theme::WEAK)),
+            Span::styled(" n ", theme::bold(t.success)),
+            Span::styled("new      ", theme::fg(t.weak)),
+            Span::styled(" d ", theme::bold(t.error)),
+            Span::styled("delete", theme::fg(t.weak)),
         ]),
         Line::from(vec![
-            Span::styled(" ↑↓ ", theme::bold(theme::INFO)),
-            Span::styled("select   ", theme::fg(theme::WEAK)),
-            Span::styled(" ⏎ ", theme::bold(theme::PRIMARY)),
-            Span::styled("open", theme::fg(theme::WEAK)),
+            Span::styled(" ↑↓ ", theme::bold(t.info)),
+            Span::styled("select   ", theme::fg(t.weak)),
+            Span::styled(" ⏎ ", theme::bold(t.primary)),
+            Span::styled("open", theme::fg(t.weak)),
         ]),
     ];
     frame.render_widget(info_block, info_area);
     frame.render_widget(
-        Paragraph::new(info).style(theme::fg(theme::INK)),
+        Paragraph::new(info).style(theme::fg(t.ink)),
         ratatui::widgets::Block::bordered()
             .border_set(border::ROUNDED)
             .inner(info_area),
@@ -284,8 +398,9 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &UiState, selected: usize,
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
+    let t = theme::active();
     let width = 46.min(area.width);
-    let height = 14.min(area.height);
+    let height = 15.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect { x, y, width, height };
@@ -293,29 +408,30 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_set(border::ROUNDED)
-        .border_style(theme::fg(theme::PRIMARY))
-        .title(Span::styled(" keybinds ", theme::bold(theme::PRIMARY)))
-        .style(Style::default().bg(theme::BG));
+        .border_style(theme::fg(t.primary))
+        .title(Span::styled(" keybinds ", theme::bold(t.primary)))
+        .style(Style::default().bg(t.bg));
     frame.render_widget(block, popup);
 
-    let rows: [(&str, &str); 10] = [
+    let rows: [(&str, &str); 11] = [
         ("enter", "send prompt / open session"),
         ("esc", "close panel · quit"),
         ("tab", "toggle sessions sidebar"),
         ("?", "toggle this help"),
+        ("/", "slash commands (type in prompt)"),
         ("pgup/pgdn", "scroll transcript"),
         ("↑/↓ j/k", "select session (sidebar)"),
         ("n", "new session (sidebar)"),
         ("d", "delete session (sidebar)"),
         ("ctrl+c", "quit immediately"),
-        ("", ""),
+        ("", "press any key to close"),
     ];
     let lines: Vec<Line> = rows
         .iter()
         .map(|(key, desc)| {
             Line::from(vec![
-                Span::styled(format!(" {key:<10}"), theme::bold(theme::INFO)),
-                Span::styled(*desc, theme::fg(theme::INK)),
+                Span::styled(format!(" {key:<10}"), theme::bold(t.info)),
+                Span::styled(*desc, theme::fg(t.ink)),
             ])
         })
         .collect();
@@ -329,28 +445,29 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 // helpers
 
 fn message_lines(message: &Message, width: usize) -> Vec<Line<'static>> {
+    let t = theme::active();
     let (label, color): (String, _) = match message.role {
-        Role::User => ("❯ you".to_string(), theme::PRIMARY),
-        Role::Assistant => (format!("✻ {BRAND}"), theme::ACCENT),
+        Role::User => ("❯ you".to_string(), t.primary),
+        Role::Assistant => (format!("✻ {BRAND}"), t.accent),
     };
     let age = ago(message.created_at);
     let mut lines = vec![Line::from(vec![
         Span::styled(label, theme::bold(color)),
-        Span::styled(format!("  · {age}"), theme::fg(theme::WEAK)),
+        Span::styled(format!("  · {age}"), theme::fg(t.weak)),
     ])];
 
     for part in &message.parts {
         match part {
             Part::Text { text } => extend_markdown_lines(text, width.saturating_sub(4), &mut lines),
             Part::ToolUse { name, .. } => lines.push(Line::from(vec![
-                Span::styled("  ⚙ tool ", theme::fg(theme::INFO)),
-                Span::styled(name.clone(), theme::bold(theme::INFO)),
+                Span::styled("  ⚙ tool ", theme::fg(t.info)),
+                Span::styled(name.clone(), theme::bold(t.info)),
             ])),
             Part::ToolResult { output, .. } => {
                 let first = output.lines().next().unwrap_or_default();
                 lines.push(Line::from(Span::styled(
                     format!("  ↳ {}", truncate(first, width.saturating_sub(5))),
-                    theme::fg(theme::SUCCESS),
+                    theme::fg(t.success),
                 )));
             }
         }
@@ -365,9 +482,8 @@ fn extend_markdown_lines(text: &str, width: usize, out: &mut Vec<Line<'static>>)
     let mut in_code = false;
     for raw in text.split('\n') {
         let wrapped = wrap_text(raw, width);
-        for (index, line) in wrapped.into_iter().enumerate() {
-            let continuation = index > 0 || in_code;
-            let styled = style_markdown_line(&line, in_code, continuation);
+        for line in wrapped {
+            let styled = style_markdown_line(&line, in_code);
             in_code = styled.1;
             out.push(styled.0);
         }
@@ -376,16 +492,14 @@ fn extend_markdown_lines(text: &str, width: usize, out: &mut Vec<Line<'static>>)
 
 type StyledLine = (Line<'static>, bool);
 
-fn style_markdown_line(line: &str, was_in_code: bool, _continuation: bool) -> StyledLine {
+fn style_markdown_line(line: &str, was_in_code: bool) -> StyledLine {
+    let t = theme::active();
     let indent = "  ";
     let trimmed = line.trim_start();
 
     if trimmed.starts_with("```") {
         return (
-            Line::from(Span::styled(
-                format!("{indent}{line}"),
-                theme::fg(theme::WEAK),
-            )),
+            Line::from(Span::styled(format!("{indent}{line}"), theme::fg(t.weak))),
             !was_in_code,
         );
     }
@@ -393,25 +507,22 @@ fn style_markdown_line(line: &str, was_in_code: bool, _continuation: bool) -> St
         return (
             Line::from(Span::styled(
                 format!("{indent}{line}"),
-                theme::fg(theme::SUCCESS),
+                theme::fg(t.success),
             )),
             true,
         );
     }
     if trimmed.starts_with('#') {
         return (
-            Line::from(Span::styled(
-                format!("{indent}{line}"),
-                theme::bold(theme::ACCENT),
-            )),
+            Line::from(Span::styled(format!("{indent}{line}"), theme::bold(t.accent))),
             false,
         );
     }
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
         return (
             Line::from(vec![
-                Span::styled(format!("{indent}  • "), theme::fg(theme::PRIMARY)),
-                Span::styled(trimmed[2..].to_string(), theme::fg(theme::INK)),
+                Span::styled(format!("{indent}  • "), theme::fg(t.primary)),
+                Span::styled(trimmed[2..].to_string(), theme::fg(t.ink)),
             ]),
             false,
         );
@@ -420,7 +531,7 @@ fn style_markdown_line(line: &str, was_in_code: bool, _continuation: bool) -> St
         return (
             Line::from(Span::styled(
                 format!("{indent}  ┃ {line}"),
-                theme::fg(theme::WARNING),
+                theme::fg(t.warning),
             )),
             false,
         );
@@ -432,18 +543,12 @@ fn style_markdown_line(line: &str, was_in_code: bool, _continuation: bool) -> St
         && trimmed.contains(". ");
     if numbered {
         return (
-            Line::from(Span::styled(
-                format!("{indent}{line}"),
-                theme::fg(theme::INFO),
-            )),
+            Line::from(Span::styled(format!("{indent}{line}"), theme::fg(t.info))),
             false,
         );
     }
     (
-        Line::from(Span::styled(
-            format!("{indent}{line}"),
-            theme::fg(theme::INK),
-        )),
+        Line::from(Span::styled(format!("{indent}{line}"), theme::fg(t.ink))),
         false,
     )
 }
@@ -475,7 +580,7 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// `ses_abc123…` → `ses_abc123`, `~/very/long/path` → shortened form.
+/// Truncate with ellipsis.
 pub fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -485,7 +590,8 @@ pub fn truncate(text: &str, max: usize) -> String {
 }
 
 pub fn shorten_path(path: &str, max: usize) -> String {
-    let replaced = path.replace(std::env::var("USERPROFILE").unwrap_or_default().as_str(), "~")
+    let replaced = path
+        .replace(std::env::var("USERPROFILE").unwrap_or_default().as_str(), "~")
         .replace(std::env::var("HOME").unwrap_or_default().as_str(), "~");
     truncate(&replaced, max)
 }
@@ -550,5 +656,33 @@ mod tests {
         assert_eq!(ago(now - chrono::Duration::seconds(120)), "2m");
         assert_eq!(ago(now - chrono::Duration::hours(3)), "3h");
         assert_eq!(ago(now - chrono::Duration::days(2)), "2d");
+    }
+
+    #[test]
+    fn command_filtering_prefixes_names_only() {
+        let mut state = UiState {
+            input: "/m".into(),
+            scroll_back: 0,
+            sidebar: SidebarState::Closed,
+            help: HelpState::Hidden,
+            sessions: vec![],
+            status: StreamStatus::Idle,
+            error: None,
+            notice: None,
+            streaming_message: None,
+            command_matches: vec![],
+            command_selected: 0,
+            plan_mode: false,
+            model_spec: "test/m".into(),
+        };
+        state.update_command_matches();
+        let names: Vec<&str> = state.command_matches.iter().map(|(n, _)| n.split(' ').next().unwrap()).collect();
+        assert_eq!(names, vec!["/model"]);
+        assert!(!state.command_matches.is_empty());
+
+        state.input = "/s".into();
+        state.update_command_matches();
+        let names: Vec<&str> = state.command_matches.iter().map(|(n, _)| n.split(' ').next().unwrap()).collect();
+        assert_eq!(names, vec!["/sessions"]);
     }
 }
