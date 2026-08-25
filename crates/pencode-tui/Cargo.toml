@@ -10,5 +10,6 @@ pencode-protocol.workspace = true
 pencode-core.workspace = true
 
 anyhow.workspace = true
+chrono.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
