@@ -75,7 +75,28 @@ async fn add_message(
     Json(body): Json<MessageBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let message = Message::new(Role::User, vec![Part::text(body.text)]);
-    let session = state.app.store().append(&id, message)?;
+    let mut session = state.app.store().append(&id, message)?;
+
+    // Generate an assistant reply when a model is configured; storage-only
+    // otherwise so the endpoint stays usable without credentials.
+    let model_spec = state
+        .app
+        .config()
+        .model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-5".to_string());
+    if let Ok(resolved) = pencode_provider::resolve(&model_spec, state.app.config()) {
+        let store = state.app.store().clone();
+        session = tokio::task::spawn_blocking(move || -> anyhow::Result<Session> {
+            let prompt = pencode_provider::Prompt::from_session(&store.get(&id)?);
+            let reply = pencode_provider::complete(&resolved, &prompt)?;
+            let reply_message = Message::new(Role::Assistant, vec![Part::text(reply)]);
+            store.append(&id, reply_message)
+        })
+        .await
+        .map_err(|err| ApiError(anyhow::anyhow!(err)))??;
+    }
+
     Ok(Json(session))
 }
 

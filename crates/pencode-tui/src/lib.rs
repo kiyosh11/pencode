@@ -12,6 +12,7 @@ pub mod render;
 
 use anyhow::Context;
 use pencode_core::App;
+use pencode_provider::{self, Prompt};
 use pencode_protocol::{Message, Part, Role};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -21,11 +22,11 @@ use render::{draw, HelpState, SidebarState, UiState};
 
 pub fn run(app: App) -> anyhow::Result<()> {
     let store = app.store().clone();
-    let model = app
-        .config()
+    let config = app.config().clone();
+    let model_spec = config
         .model
         .clone()
-        .unwrap_or_else(|| "(model not configured)".to_string());
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-5".to_string());
     let directory = std::env::current_dir()
         .map(|dir| dir.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
@@ -57,6 +58,9 @@ pub fn run(app: App) -> anyhow::Result<()> {
         },
         help: HelpState::Hidden,
         sessions,
+        status: render::StreamStatus::Idle,
+        error: None,
+        streaming_message: None,
     };
 
     let result = event_loop(
@@ -64,8 +68,9 @@ pub fn run(app: App) -> anyhow::Result<()> {
         &mut session,
         &mut state,
         &store,
-        &model,
+        &model_spec,
         &directory,
+        &config,
     );
 
     crossterm::terminal::disable_raw_mode()?;
@@ -82,11 +87,51 @@ fn event_loop(
     session: &mut pencode_protocol::Session,
     state: &mut UiState,
     store: &pencode_core::session::Store,
-    model: &str,
+    model_spec: &str,
     directory: &str,
+    config: &pencode_core::config::Config,
 ) -> anyhow::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
+    let mut assistant_index: Option<usize> = None;
+
     loop {
-        terminal.draw(|frame| draw(frame, session, state, model, directory))?;
+        // Drain any provider deltas that arrived since the last frame.
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                StreamEvent::Delta(text) => {
+                    state.status = render::StreamStatus::Streaming;
+                    let index = match assistant_index {
+                        Some(index) => index,
+                        None => {
+                            let message =
+                                pencode_protocol::Message::new(Role::Assistant, Vec::new());
+                            session.push(message);
+                            let index = session.messages.len() - 1;
+                            assistant_index = Some(index);
+                            index
+                        }
+                    };
+                    append_text(&mut session.messages[index], &text);
+                }
+                StreamEvent::Finished(result) => {
+                    if let Err(err) = result {
+                        state.error = Some(truncate_error(&err.to_string()));
+                        // Drop a half-written empty assistant bubble.
+                        if let Some(index) = assistant_index {
+                            if session.messages[index].text().is_empty() {
+                                session.messages.remove(index);
+                            }
+                        }
+                    }
+                    assistant_index = None;
+                    state.streaming_message = None;
+                    state.status = render::StreamStatus::Idle;
+                    store.save(session)?;
+                }
+            }
+        }
+
+        terminal.draw(|frame| draw(frame, session, state, model_spec, directory))?;
 
         if !crossterm::event::poll(std::time::Duration::from_millis(100))? {
             continue;
@@ -139,17 +184,32 @@ fn event_loop(
                             if let Some(target) = state.sessions.get(selected).map(|s| s.id.clone())
                             {
                                 *session = store.get(&target)?;
+                                assistant_index = None;
                                 state.scroll_back = 0;
                                 state.sidebar = SidebarState::Closed;
                             }
                         } else if !state.input.trim().is_empty() {
+                            if state.streaming_message.is_some() {
+                                // A request is already in flight; ignore.
+                                continue;
+                            }
                             let text = std::mem::take(&mut state.input);
                             state.scroll_back = 0;
                             let message = Message::new(Role::User, vec![Part::text(text)]);
                             session.push(message);
                             store.save(session)?;
-                            // TODO: route through the model provider once wired up;
-                            // assistant replies currently arrive via the server API.
+
+                            match pencode_provider::resolve(model_spec, config) {
+                                Ok(resolved) => {
+                                    state.status = render::StreamStatus::Thinking;
+                                    state.error = None;
+                                    state.streaming_message = Some(session.id.clone());
+                                    spawn_completion(tx.clone(), resolved, Prompt::from_session(session));
+                                }
+                                Err(err) => {
+                                    state.error = Some(truncate_error(&err.to_string()));
+                                }
+                            }
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k')
@@ -206,4 +266,38 @@ fn event_loop(
 fn flush_stdout(stdout: &mut Stdout) -> anyhow::Result<()> {
     use std::io::Write;
     stdout.flush().context("flushing stdout")
+}
+
+// ---------------------------------------------------------------------------
+// provider streaming
+
+enum StreamEvent {
+    Delta(String),
+    Finished(anyhow::Result<String>),
+}
+
+fn spawn_completion(
+    tx: std::sync::mpsc::Sender<StreamEvent>,
+    resolved: pencode_provider::Resolved,
+    prompt: pencode_provider::Prompt,
+) {
+    let _ = std::thread::spawn(move || {
+        let result = pencode_provider::stream(&resolved, &prompt, &mut |delta| {
+            let _ = tx.send(StreamEvent::Delta(delta.to_string()));
+        });
+        let _ = tx.send(StreamEvent::Finished(result));
+    });
+}
+
+fn append_text(message: &mut Message, extra: &str) {
+    if let Some(Part::Text { text }) = message.parts.last_mut() {
+        text.push_str(extra);
+        return;
+    }
+    message.parts.push(Part::text(extra));
+}
+
+fn truncate_error(err: &str) -> String {
+    let one_line = err.replace('\n', " ");
+    render::truncate(&one_line, 120)
 }

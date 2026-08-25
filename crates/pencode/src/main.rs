@@ -76,8 +76,41 @@ fn run_prompt(prompt: Option<String>, directory: Option<String>) -> anyhow::Resu
     let session = store.append(&session.id, user_message)?;
 
     println!("session {}", session.id);
-    println!("stored prompt ({} bytes).", prompt.len());
-    println!("model provider integration is not wired up yet — see crates/pencode-core/src/tool.rs");
+    println!("model  {}", app.config().model.clone().unwrap_or_else(|| "anthropic/claude-sonnet-4-5 (default)".into()));
+
+    let model_spec = app
+        .config()
+        .model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-5".to_string());
+    match pencode_provider::resolve(&model_spec, app.config()) {
+        Ok(resolved) => {
+            print!("pencode ");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let reply = pencode_provider::stream(
+                &resolved,
+                &pencode_provider::Prompt::from_session(&session),
+                &mut |delta| {
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                },
+            );
+            match reply {
+                Ok(full) => {
+                    let reply_message = Message::new(Role::Assistant, vec![Part::text(full)]);
+                    store.append(&session.id, reply_message)?;
+                    println!();
+                }
+                Err(err) => {
+                    println!("\n⚠ {err:#}");
+                }
+            }
+        }
+        Err(err) => {
+            println!("⚠ prompt stored, but no provider available: {err:#}");
+        }
+    }
     Ok(())
 }
 

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 pencode-protocol.workspace = true
 pencode-core.workspace = true
+pencode-provider.workspace = true
 pencode-server.workspace = true
 pencode-client.workspace = true
 pencode-tui.workspace = true

@@ -26,6 +26,13 @@ pub enum HelpState {
     Visible,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamStatus {
+    Idle,
+    Thinking,
+    Streaming,
+}
+
 pub struct UiState {
     pub input: String,
     /// Lines scrolled back from the newest message (0 = pinned to bottom).
@@ -33,6 +40,10 @@ pub struct UiState {
     pub sidebar: SidebarState,
     pub help: HelpState,
     pub sessions: Vec<pencode_protocol::Session>,
+    pub status: StreamStatus,
+    pub error: Option<String>,
+    /// Session id a completion is currently streaming into.
+    pub streaming_message: Option<String>,
 }
 
 impl UiState {
@@ -86,18 +97,29 @@ fn draw_main(
     ])
     .areas(area);
 
-    // Header: brand + session title + working directory.
+    // Header: brand + session title + working directory (+ stream status).
     let dir_label = shorten_path(directory, 32);
-    let title_width = area
-        .width
-        .saturating_sub(dir_label.chars().count() as u16 + 24)
-        .max(8) as usize;
+    let status_text = match state.status {
+        StreamStatus::Idle => match &state.error {
+            Some(err) => format!("  ⚠ {}", truncate(err, 48)),
+            None => String::new(),
+        },
+        StreamStatus::Thinking => "  ◍ thinking…".to_string(),
+        StreamStatus::Streaming => "  ✻ streaming…".to_string(),
+    };
+    let fixed = dir_label.chars().count() as u16 + status_text.chars().count() as u16 + 24;
+    let title_width = area.width.saturating_sub(fixed).max(8) as usize;
     let header = Line::from(vec![
         Span::styled(" ◆ ", theme::bold(theme::PRIMARY)),
         Span::styled(BRAND, theme::bold(theme::PRIMARY)),
         Span::styled("  │  ", theme::fg(theme::WEAK)),
         Span::styled(truncate(&session.title, title_width), theme::fg(theme::INK)),
         Span::styled(format!("  ({dir_label})"), theme::fg(theme::WEAK)),
+        match state.status {
+            StreamStatus::Idle => Span::styled(status_text, theme::fg(theme::ERROR)),
+            StreamStatus::Thinking => Span::styled(status_text, theme::bold(theme::WARNING)),
+            StreamStatus::Streaming => Span::styled(status_text, theme::bold(theme::ACCENT)),
+        },
     ]);
     frame.render_widget(Paragraph::new(header), header_area);
 

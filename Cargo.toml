@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pencode",
     "crates/pencode-core",
+    "crates/pencode-provider",
     "crates/pencode-protocol",
     "crates/pencode-server",
     "crates/pencode-client",
@@ -18,6 +19,7 @@ repository = "https://github.com/kiyosh11/pencode"
 [workspace.dependencies]
 pencode-protocol = { path = "crates/pencode-protocol" }
 pencode-core = { path = "crates/pencode-core" }
+pencode-provider = { path = "crates/pencode-provider" }
 pencode-server = { path = "crates/pencode-server" }
 pencode-client = { path = "crates/pencode-client" }
 pencode-tui = { path = "crates/pencode-tui" }
