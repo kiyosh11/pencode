@@ -22,3 +22,7 @@ Cargo.lock.bak
 pencode-dev
 UPCOMING_CHANGELOG.md
 logs/
+
+# runtime session data
+session/
+.pencode/
